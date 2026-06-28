@@ -1,0 +1,415 @@
+# SETUP: Install and load required packages
+
+if(!require(tidyverse))  install.packages("tidyverse")
+if(!require(readxl))     install.packages("readxl")
+if(!require(writexl))    install.packages("writexl")
+if(!require(showtext))   install.packages("showtext")
+if(!require(httr))       install.packages("httr")
+if(!require(jsonlite))   install.packages("jsonlite")
+
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(showtext)
+library(httr)
+library(jsonlite)
+
+# FONT: Mac-native Helvetica
+
+font_add("Helvetica", regular = "/System/Library/Fonts/Helvetica.ttc")
+showtext_auto()
+
+
+# WORKING DIRECTORY
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+
+# Combined dataset
+
+raw_data <- read_excel("bci_combined_datasets.xlsx")
+
+
+# Extract senior author (last author in Author Names)
+
+raw_data <- raw_data %>%
+  mutate(
+    Senior_Author = map_chr(
+      str_split(`Author Names`, ";"),
+      ~ trimws(tail(.x[nzchar(trimws(.x))], 1))
+    )
+  )
+
+
+# Format senior author name as F. M. Lastname
+# ============================================================
+# STEP 3: Format senior author name as F. M. Lastname
+# Handles three formats found in combined WoS + Scopus data:
+# Format A (WoS):    "Lastname, INITIALS"   e.g. "Nicolelis, MAL"
+# Format B (Scopus): "Lastname I.I."        e.g. "Nicolelis M.A.L."
+# Format C (Scopus): "Lastname Firstname"   e.g. "St Lawrence K.S."
+# ============================================================
+format_author_name <- function(name) {
+  if (is.na(name) || nchar(trimws(name)) == 0) return(NA_character_)
+
+  name <- trimws(name)
+
+  # FORMAT A: WoS style — "Lastname, INITIALS" (comma present, no periods in initials)
+  if (str_detect(name, ",")) {
+    parts     <- str_split(name, ",", simplify = TRUE)
+    last      <- str_to_title(trimws(parts[1]))
+    first_raw <- trimws(parts[2])
+
+    # Extract individual letters as initials
+    initials     <- str_extract_all(first_raw, "[A-Za-z]")[[1]]
+    initials_fmt <- paste0(toupper(initials), ".", collapse = " ")
+    return(paste(initials_fmt, last))
+  }
+
+  # FORMAT B/C: Scopus style — "Lastname I." or "Lastname Firstname I.I."
+  # Strategy: tokens split by space; last token that contains only
+  # letters and periods is the initials block; everything before is the last name
+  tokens <- str_split(name, "\\s+", simplify = TRUE)
+  tokens <- tokens[nzchar(tokens)]
+
+  if (length(tokens) == 1) return(str_to_title(tokens[1]))
+
+  # Find which tokens are initials (contain periods or are single letters)
+  is_initial_block <- str_detect(tokens, "^[A-Za-z][A-Za-z.\\-]*\\.$|^[A-Za-z]$")
+
+  # Last name = all tokens that are NOT initial blocks, from the start
+  last_tokens    <- tokens[!is_initial_block]
+  initial_tokens <- tokens[is_initial_block]
+
+  # If nothing detected as initials, fall back: last token = initials, rest = lastname
+  if (length(initial_tokens) == 0) {
+    initial_tokens <- tail(tokens, 1)
+    last_tokens    <- head(tokens, -1)
+  }
+
+  last <- str_to_title(paste(last_tokens, collapse = " "))
+
+  # Extract individual letters from all initial tokens
+  all_initials <- str_extract_all(paste(initial_tokens, collapse = ""), "[A-Za-z]")[[1]]
+  initials_fmt <- paste0(toupper(all_initials), ".", collapse = " ")
+
+  paste(initials_fmt, last)
+}
+
+raw_data <- raw_data %>%
+  mutate(Senior_Author_Formatted = map_chr(Senior_Author, format_author_name))
+
+# Deduplicate: where the same person appears in both WoS and Scopus
+# formats, keep only one version by matching on cleaned last name + first initial
+raw_data <- raw_data %>%
+  mutate(
+    Author_Key = str_extract(Senior_Author_Formatted, "[A-Z]\\..+$") %>%
+                 str_to_lower() %>%
+                 str_remove_all("[^a-z]")
+  )
+
+# Calculate fractional paper count per row
+# Each paper counts as 1 / number_of_authors for each author
+
+raw_data <- raw_data %>%
+  mutate(
+    N_Authors        = map_int(str_split(`Author Names`, ";"),
+                               ~ sum(nzchar(trimws(.x)))),
+    Fractional_Count = 1 / N_Authors
+  )
+
+# Retrieve all author affiliation countries via OpenAlex API using DOI links
+# All unique countries per paper are listed, semicolon-separated.
+# Papers with no affiliation data are recorded as NA.
+
+get_countries_from_doi <- function(doi) {
+  if (is.na(doi) || nchar(trimws(doi)) == 0) return(NA_character_)
+  
+  # Clean DOI — strip URL prefix, keep just the DOI string
+  doi_clean <- str_remove(doi, "https?://(dx\\.)?doi\\.org/")
+  
+  # Query OpenAlex works endpoint by DOI
+  url <- paste0("https://api.openalex.org/works/https://doi.org/", doi_clean)
+  
+  tryCatch({
+    response <- GET(url, add_headers("User-Agent" = "ThinkNeuro Research/1.0"))
+    
+    if (status_code(response) != 200) return(NA_character_)
+    
+    data <- fromJSON(content(response, as = "text", encoding = "UTF-8"),
+                     flatten = TRUE)
+    
+    # Extract all author affiliations
+    authorships <- data$authorships
+    
+    if (is.null(authorships) || length(authorships) == 0) return(NA_character_)
+    
+    # Pull country codes from institution affiliations
+    countries <- authorships %>%
+      unnest(cols = any_of("institutions"), keep_empty = TRUE) %>%
+      pull(any_of("country_code")) %>%
+      discard(is.na) %>%
+      unique()
+    
+    if (length(countries) == 0) return(NA_character_)
+    
+    # Convert ISO country codes to full country names
+    country_names <- countrycode::countrycode(
+      countries,
+      origin      = "iso2c",
+      destination = "country.name",
+      warn        = FALSE
+    )
+    
+    paste(na.omit(country_names), collapse = "; ")
+    
+  }, error = function(e) NA_character_)
+}
+
+# Install countrycode if needed for converting ISO codes to names
+if(!require(countrycode)) install.packages("countrycode")
+library(countrycode)
+
+message("Fetching country data from OpenAlex API — this may take several minutes...")
+raw_data <- raw_data %>%
+  mutate(Countries = map_chr(`DOI Link`, get_countries_from_doi))
+
+# Save enriched dataset to a new Excel file
+
+write_xlsx(raw_data, "bci_enriched_dataset.xlsx")
+message("Enriched dataset saved to bci_enriched_dataset.xlsx")
+
+# Aggregate top 10 senior authors by fractional count
+
+# Aggregate top 10 senior authors by fractional count
+# Group by Author_Key to merge duplicates
+author_stats <- raw_data %>%
+  group_by(Author_Key) %>%
+  summarise(
+    Senior_Author_Formatted = first(Senior_Author_Formatted),
+    Papers    = sum(Fractional_Count, na.rm = TRUE),
+    Citations = sum(`Citation Count`, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(Papers)) %>%
+  slice_head(n = 10)
+
+# Build the dual-axis figure
+
+scale_factor <- max(author_stats$Citations) / max(author_stats$Papers)
+
+p <- ggplot(author_stats, aes(x = reorder(Senior_Author_Formatted, -Papers))) +
+  geom_bar(aes(y = Papers), stat = "identity", fill = "#2E5F7E", alpha = 0.95) +
+  geom_line(aes(y = Citations / scale_factor, group = 1),
+            color = "#5BB8F5", linewidth = 1.2) +
+  geom_point(aes(y = Citations / scale_factor),
+             color = "#000080", size = 3) +
+  scale_x_discrete(name = "Author Name") +
+  scale_y_continuous(
+    name     = "Fractional Paper Count (Bar)",
+    limits   = c(0, NA),
+    breaks   = pretty(c(0, max(author_stats$Papers)), n = 6),
+    labels   = function(x) round(x, 1),
+    sec.axis = sec_axis(
+      ~ . * scale_factor,
+      name   = "Total Citations (Line)",
+      breaks = pretty(c(0, max(author_stats$Citations)), n = 6),
+      labels = function(x) round(x, 0)
+    )
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title    = "Top 10 Senior Authors Driving Research",
+    subtitle = "Calculated via Fractional Counting Analysis"
+  ) +
+  theme(
+    text               = element_text(family = "Helvetica", size = 14),
+    axis.text          = element_text(family = "Helvetica", size = 12),
+    axis.text.x        = element_text(family = "Helvetica", size = 11,
+                                      angle = 45, hjust = 1),
+    axis.text.y        = element_text(family = "Helvetica", size = 12),
+    axis.text.y.right  = element_text(family = "Helvetica", size = 12),
+    axis.title.x       = element_text(family = "Helvetica", size = 13,
+                                      face = "bold", margin = margin(t = 10)),
+    axis.title.y       = element_text(family = "Helvetica", size = 13,
+                                      face = "bold", margin = margin(r = 10)),
+    axis.title.y.right = element_text(family = "Helvetica", size = 13,
+                                      face = "bold", angle = 90,
+                                      margin = margin(l = 10)),
+    plot.title         = element_text(family = "Helvetica", size = 16,
+                                      face = "bold", margin = margin(b = 4)),
+    plot.subtitle      = element_text(family = "Helvetica", size = 13,
+                                      margin = margin(b = 10)),
+    panel.grid.major   = element_line(color = "grey90"),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(t = 20, r = 20, b = 20, l = 20)
+  )
+
+showtext_opts(dpi = 1000)
+
+ggsave("Author_Citations_DualAxis_1000dpi.png",
+       plot = p, width = 10, height = 6, dpi = 1000)
+
+message("Execution Complete! Check your folder for your deliverables.")
+
+
+# Use same formatting to create countries and institutions plots
+# Load enriched dataset
+
+enriched <- read_excel("bci_enriched_dataset.xlsx")
+
+# Fetch institutions from OpenAlex API by DOI
+
+get_institutions_from_doi <- function(doi) {
+  if (is.na(doi) || nchar(trimws(doi)) == 0) return(NA_character_)
+  
+  doi_clean <- str_remove(doi, "https?://(dx\\.)?doi\\.org/")
+  url <- paste0("https://api.openalex.org/works/https://doi.org/", doi_clean)
+  
+  tryCatch({
+    response <- GET(url, add_headers("User-Agent" = "ThinkNeuro Research/1.0"))
+    if (status_code(response) != 200) return(NA_character_)
+    
+    data <- fromJSON(content(response, as = "text", encoding = "UTF-8"),
+                     flatten = TRUE)
+    
+    authorships <- data$authorships
+    if (is.null(authorships) || length(authorships) == 0) return(NA_character_)
+    
+    institutions <- authorships %>%
+      unnest(cols = any_of("institutions"), keep_empty = TRUE) %>%
+      pull(any_of("display_name")) %>%
+      discard(is.na) %>%
+      unique()
+    
+    if (length(institutions) == 0) return(NA_character_)
+    paste(institutions, collapse = "; ")
+    
+  }, error = function(e) NA_character_)
+}
+
+message("Fetching institution data from OpenAlex API — this may take several minutes...")
+enriched <- enriched %>%
+  mutate(Institutions = map_chr(`DOI Link`, get_institutions_from_doi))
+
+# Save updated enriched dataset with institutions added
+
+write_xlsx(enriched, "bci_enriched_dataset.xlsx")
+message("Enriched dataset updated with Institutions column.")
+
+
+# SHARED PLOT THEME: matches the senior author figure exactly
+
+bci_theme <- function() {
+  theme_minimal(base_size = 14) +
+    theme(
+      text               = element_text(family = "Helvetica", size = 14),
+      axis.text          = element_text(family = "Helvetica", size = 10),
+      axis.text.x        = element_text(family = "Helvetica", size = 9,
+                                        angle = 45, hjust = 1),
+      axis.text.y        = element_text(family = "Helvetica", size = 10),
+      axis.text.y.right  = element_text(family = "Helvetica", size = 10),
+      axis.title.x       = element_text(family = "Helvetica", size = 11,
+                                        face = "bold", margin = margin(t = 10)),
+      axis.title.y       = element_text(family = "Helvetica", size = 11,
+                                        face = "bold", margin = margin(r = 10)),
+      axis.title.y.right = element_text(family = "Helvetica", size = 11,
+                                        face = "bold", angle = 90,
+                                        margin = margin(l = 10)),
+      plot.title         = element_text(family = "Helvetica", size = 16,
+                                        face = "bold", margin = margin(b = 4)),
+      plot.subtitle      = element_text(family = "Helvetica", size = 11,
+                                        margin = margin(b = 10)),
+      panel.grid.major   = element_line(color = "grey90"),
+      panel.grid.minor   = element_blank(),
+      plot.margin        = margin(t = 20, r = 20, b = 20, l = 20)
+    )
+}
+
+
+# SHARED PLOT FUNCTION: build dual-axis bar + line figure
+
+build_dual_axis_plot <- function(data, x_col, title_text) {
+  scale_factor <- max(data$Citations) / max(data$Papers)
+  
+  ggplot(data, aes(x = reorder(.data[[x_col]], -Papers))) +
+    geom_bar(aes(y = Papers), stat = "identity", fill = "#2E5F7E", alpha = 0.95) +
+    geom_line(aes(y = Citations / scale_factor, group = 1),
+              color = "#5BB8F5", linewidth = 1.2) +
+    geom_point(aes(y = Citations / scale_factor),
+               color = "#000080", size = 3) +
+    scale_x_discrete(name = x_col) +
+    scale_y_continuous(
+      name     = "Fractional Paper Count (Bar)",
+      limits   = c(0, NA),
+      breaks   = pretty(c(0, max(data$Papers)), n = 6),
+      labels   = function(x) round(x, 1),
+      sec.axis = sec_axis(
+        ~ . * scale_factor,
+        name   = "Total Citations (Line)",
+        breaks = pretty(c(0, max(data$Citations)), n = 6),
+        labels = function(x) round(x, 0)
+      )
+    ) +
+    labs(
+      title    = title_text,
+      subtitle = "Calculated via Fractional Counting Analysis",
+      x        = x_col
+    ) +
+    bci_theme()
+}
+
+
+# Top 10 Countries Driving Research
+# Countries column is semicolon-separated; each country in a multi-country paper receives the full fractional count
+           
+country_stats <- enriched %>%
+  filter(!is.na(Countries)) %>%
+  mutate(Country_List = str_split(Countries, ";\\s*")) %>%
+  unnest(Country_List) %>%
+  mutate(Country_List = trimws(Country_List)) %>%
+  filter(nzchar(Country_List)) %>%
+  group_by(Country_List) %>%
+  summarise(
+    Papers    = sum(Fractional_Count, na.rm = TRUE),
+    Citations = sum(`Citation Count`, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(Papers)) %>%
+  slice_head(n = 10)
+
+p_country <- build_dual_axis_plot(country_stats %>% rename(Country = Country_List), 
+                                  "Country",
+                                  "Top 10 Countries Driving Research")
+
+ggsave("Country_Citations_DualAxis_1000dpi.png",
+       plot = p_country, width = 10, height = 6, dpi = 1000)
+message("Country figure saved.")
+
+
+# Top 10 Institutions Driving Research
+
+institution_stats <- enriched %>%
+  filter(!is.na(Institutions)) %>%
+  mutate(Institution_List = str_split(Institutions, ";\\s*")) %>%
+  unnest(Institution_List) %>%
+  mutate(Institution_List = trimws(Institution_List)) %>%
+  filter(nzchar(Institution_List)) %>%
+  group_by(Institution_List) %>%
+  summarise(
+    Papers    = sum(Fractional_Count, na.rm = TRUE),
+    Citations = sum(`Citation Count`, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(Papers)) %>%
+  slice_head(n = 10)
+
+p_institution <- build_dual_axis_plot(institution_stats %>% rename(Institution = Institution_List),
+                                      "Institution",
+                                      "Top 10 Institutions Driving Research")
+
+ggsave("Institution_Citations_DualAxis_1000dpi.png",
+       plot = p_institution, width = 10, height = 6, dpi = 1000)
+message("Institution figure saved.")
+
+message("All done! Check your folder for both new figures and the updated dataset.")
