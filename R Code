@@ -42,9 +42,6 @@ raw_data <- raw_data %>%
 
 
 # Format senior author name as F. M. Lastname
-# ============================================================
-# STEP 3: Format senior author name as F. M. Lastname
-# Handles three formats found in combined WoS + Scopus data:
 # Format A (WoS):    "Lastname, INITIALS"   e.g. "Nicolelis, MAL"
 # Format B (Scopus): "Lastname I.I."        e.g. "Nicolelis M.A.L."
 # Format C (Scopus): "Lastname Firstname"   e.g. "St Lawrence K.S."
@@ -298,7 +295,7 @@ write_xlsx(enriched, "bci_enriched_dataset.xlsx")
 message("Enriched dataset updated with Institutions column.")
 
 
-# SHARED PLOT THEME: matches the senior author figure exactly
+# SHARED PLOT THEME
 
 bci_theme <- function() {
   theme_minimal(base_size = 14) +
@@ -361,7 +358,7 @@ build_dual_axis_plot <- function(data, x_col, title_text) {
 
 
 # Top 10 Countries Driving Research
-# Countries column is semicolon-separated; each country in a multi-country paper receives the full fractional count
+# Countries column is semicolon-separated
            
 country_stats <- enriched %>%
   filter(!is.na(Countries)) %>%
